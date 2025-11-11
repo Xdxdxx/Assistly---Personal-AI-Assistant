@@ -147,7 +147,7 @@ app.post("/gmail/send", async (req, res) => {
 // ==============================
 // 6️⃣ ASSISTLY CHATBOT ENDPOINT
 // ==============================
-app.post("/api/chat", async (req, res) => {
+app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
 
@@ -184,6 +184,7 @@ app.post("/api/chat", async (req, res) => {
 // ==============================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Assistly backend running on port ${PORT}`));
+
 
 
 
