@@ -1,5 +1,5 @@
 // ===============================
-// Assistly Server (UPDATED)
+// Assistly Server (TOKEN REFRESH FIX)
 // ===============================
 import express from "express";
 import cors from "cors";
@@ -25,7 +25,6 @@ const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 // ===============================
 // The REDIRECT_BASE_URL MUST be set as an environment variable in Render 
 // and MUST match the base URL registered in your Google Cloud Console.
-// It defaults to your confirmed Render URL if the ENV var is missing.
 const REDIRECT_BASE_URL = process.env.REDIRECT_BASE_URL || "https://art-chatbot.onrender.com";
 const REDIRECT_URI = `${REDIRECT_BASE_URL}/auth/google/callback`;
 
@@ -38,7 +37,6 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ⚠️ Temporary in-memory token storage (use a DB for multiple users)
-// This is fine for a single user proof-of-concept.
 let userTokens = {};
 
 // ===============================
@@ -49,11 +47,12 @@ let userTokens = {};
 app.get("/auth/google", (req, res) => {
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: "offline",
+    // ⚠️ IMPORTANT: prompt: 'consent' forces Google to issue a new refresh token every time.
+    prompt: "consent", 
     scope: [
-      "https://www.googleapis.com/auth/gmail.send", // Scope to allow sending emails
-      "https://www.googleapis.com/auth/userinfo.email", // Scope to get the connected email address
+      "https://www.googleapis.com/auth/gmail.send", 
+      "https://www.googleapis.com/auth/userinfo.email", 
     ],
-    // State parameter is used to protect against CSRF attacks. We'll use a simple timestamp here.
     state: Date.now().toString(), 
   });
   res.redirect(authUrl);
@@ -65,10 +64,11 @@ app.get("/auth/google/callback", async (req, res) => {
 
   try {
     const { tokens } = await oauth2Client.getToken(code);
+    
+    // Store ALL tokens (including refresh_token)
+    userTokens = tokens; 
+    
     oauth2Client.setCredentials(tokens);
-
-    // Store tokens globally for simplicity (in a real app, store this per user in a DB)
-    userTokens = tokens;
     
     // Use the token to fetch the connected user's email address
     const response = await fetch('https://www.googleapis.com/oauth2/v1/userinfo?alt=json', {
@@ -76,6 +76,9 @@ app.get("/auth/google/callback", async (req, res) => {
     });
     const profile = await response.json();
     userTokens.email = profile.email;
+    
+    // Log for debugging: confirm refresh token exists
+    console.log("Authentication successful. Refresh Token received:", !!userTokens.refresh_token);
 
     // Close the pop-up window in the frontend
     res.send('<script>window.close();</script>');
@@ -90,8 +93,8 @@ app.get("/auth/google/callback", async (req, res) => {
 // ===============================
 // The frontend calls this to update the UI status.
 app.get("/gmail-status", (req, res) => {
-    if (userTokens.access_token && userTokens.email) {
-        // Assume connected if tokens and email exist (tokens may expire, but that's handled during send attempt)
+    // Check for refresh_token as well, as that's what keeps the session alive long-term
+    if (userTokens.access_token && userTokens.email && userTokens.refresh_token) {
         res.json({ connected: true, email: userTokens.email });
     } else {
         res.json({ connected: false, email: null });
@@ -107,21 +110,25 @@ app.post("/send-email", async (req, res) => {
   const { to, subject, body } = req.body;
 
   if (!userTokens.access_token) {
-    // Return a 401 if the user is not authenticated.
     return res.status(401).json({ 
         success: false, 
         message: "🚫 Error: Gmail not connected. Please connect your Gmail account first." 
     });
   }
 
-  // Set credentials for the current user
+  // Set credentials from stored tokens
   oauth2Client.setCredentials(userTokens);
   
   try {
-    // 1. Get a refreshed access token if the current one is expired
-    // The googleapis library handles token refreshing automatically if `refresh_token` exists.
-    await oauth2Client.getAccessToken(); 
+    // 1. Explicitly refresh the token before use. 
+    // This handles expiry and updates userTokens if successful.
+    const { credentials } = await oauth2Client.refreshAccessToken(); 
+    // Update the in-memory token store with the new access token
+    userTokens.access_token = credentials.access_token; 
+    userTokens.expiry_date = credentials.expiry_date; 
     
+    console.log("Token successfully refreshed. Proceeding with email send.");
+
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
     
     // 2. Format the email as a raw, base64url-encoded string
@@ -154,11 +161,18 @@ app.post("/send-email", async (req, res) => {
     });
   } catch (error) {
     console.error("Email send error:", error);
-    // If the error indicates token failure, you might want to clear the token state
-    if (error.message.includes('invalid_grant') || error.message.includes('Token has been expired')) {
-         userTokens = {}; // Clear tokens to force re-auth
+    
+    // ⚠️ CRITICAL: Check for common token failure messages (e.g., Google or JWT errors)
+    if (error.code === 401 || error.message.includes('invalid_grant') || error.message.includes('invalid_token')) {
+         userTokens = {}; // Clear tokens to force a full re-auth
+         console.log("Access token is invalid. Cleared userTokens.");
+         return res.status(401).json({ 
+            success: false, 
+            message: "❌ Failed to send email. The Gmail connection is no longer valid. Please click 'Connect Gmail' to re-authenticate." 
+        });
     }
-    res.status(500).json({ success: false, message: "❌ Failed to send email. You may need to reconnect your Gmail account." });
+
+    res.status(500).json({ success: false, message: "❌ Failed to send email. A server error occurred." });
   }
 });
 
@@ -206,14 +220,14 @@ app.post("/chat", async (req, res) => {
 
 
     const payload = {
-      model: "gpt-4o-mini", // Excellent model for general chat and function calling
+      model: "gpt-4o-mini", 
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: message },
       ],
       // Only provide the tool if the frontend has confirmed the user is authenticated
       tools: isGmailConnected ? [emailToolDefinition] : undefined, 
-      tool_choice: "auto", // Allow the model to decide whether to call the function or respond normally
+      tool_choice: "auto", 
     };
 
     const response = await fetch(OPENAI_URL, {
@@ -256,7 +270,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
-
 
 
 
