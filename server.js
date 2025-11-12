@@ -26,7 +26,7 @@ const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 // The redirect URI MUST match the one set in your Google Cloud Console.
 // Change "http://localhost:3000/auth/google/callback" to your actual
 // Render/Netlify backend URL (e.g., https://your-backend.onrender.com/auth/google/callback)
-const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3000/auth/google/callback";
+const REDIRECT_URI = process.env.REDIRECT_URI || "https://art-chatbot.onrender.com/auth/google/callback";
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
