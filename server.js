@@ -226,16 +226,14 @@ const emailToolDefinition = {
 // ===============================
 app.post("/chat", async (req, res) => {
   try {
-    // ⚠️ FIX: Destructure the correct properties from the body
     const { currentChat, isGmailConnected } = req.body; 
 
     if (!currentChat || currentChat.length === 0) {
         return res.status(400).json({ error: "Missing chat history." });
     }
 
-    // ⚠️ FIX: Construct the message history array in OpenAI format
+    // Construct the message history array in OpenAI format
     const formattedHistory = currentChat.map(msg => ({
-        // Map 'user' to 'user' role, and 'bot' to 'assistant' role
         role: msg.sender === 'user' ? 'user' : 'assistant',
         content: msg.text,
     }));
@@ -244,7 +242,7 @@ app.post("/chat", async (req, res) => {
     const systemInstruction = {
         role: "system",
         content: `You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. Format your answers cleanly with bold key points and bullet lists where relevant.
-        ${isGmailConnected ? 'The user is currently connected to their Gmail account. Use the `send_email` tool when they ask to draft or send a new email.' : 'The user is NOT connected to their Gmail account. Do not offer or use the `send_email` tool.'}`,
+        ${isGmailConnected ? 'The user is currently connected to their Gmail account. Use the `send_email` tool when they ask to draft or send an email.' : 'The user is NOT connected to their Gmail account. Do not offer or use the `send_email` tool.'}`,
     };
     
     // Construct the final payload for OpenAI
@@ -264,14 +262,32 @@ app.post("/chat", async (req, res) => {
       body: JSON.stringify(payload),
     });
 
+    // 🔴 CRITICAL FIX 1: Check the HTTP status from the OpenAI API first
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`OpenAI HTTP Error ${response.status}:`, errorText);
+        // Respond with a 502 Bad Gateway error and provide the detail
+        return res.status(502).json({ 
+            error: `OpenAI API returned non-OK status: ${response.status}`,
+            details: errorText.substring(0, 200) // Limit detail length for security/readability
+        });
+    }
+
     const data = await response.json();
     const candidate = data.choices?.[0]?.message;
 
-    // Check for OpenAI API errors (e.g., invalid key, rate limit)
+    // Check for OpenAI API errors contained in the JSON body (e.g., bad API key)
     if (data.error) {
-        console.error("OpenAI API Error:", data.error);
+        console.error("OpenAI API JSON Error:", data.error);
         return res.status(502).json({ error: data.error.message || "OpenAI API returned an error." });
     }
+    
+    // Check if the candidate message is entirely missing/malformed
+    if (!candidate) {
+        console.error("OpenAI response missing candidate message:", data);
+        return res.status(502).json({ error: "OpenAI response was empty or malformed." });
+    }
+
 
     // Check if the AI decided to call a function/tool
     if (candidate && candidate.tool_calls && candidate.tool_calls.length > 0) {
@@ -284,13 +300,20 @@ app.post("/chat", async (req, res) => {
     }
 
     // If no function call, return the standard text reply
-    const aiResponse = candidate?.content || "No response. (AI content missing)";
-    res.json({ reply: aiResponse });
+    const aiResponse = candidate?.content; // 'content' might be null if a tool call occurred and was not handled
+    
+    // Ensure we send back a useful reply or a known error
+    if (aiResponse) {
+        res.json({ reply: aiResponse });
+    } else {
+        console.error("AI response content was null/undefined but no tool call was processed:", candidate);
+        res.status(500).json({ error: "AI response content was empty." });
+    }
 
   } catch (error) {
-    console.log("Request Body:", req.body); // Log request body for debugging
-    console.error("Chatbot error:", error);
-    res.status(500).json({ error: "Failed to connect to AI service." });
+    console.log("Chat Request Body:", req.body); // Log request body for debugging
+    console.error("Chatbot endpoint internal error:", error);
+    res.status(500).json({ error: "Failed to connect to AI service (internal server error)." });
   }
 });
 
@@ -315,6 +338,13 @@ app.post("/title", async (req, res) => {
             }),
         });
 
+        // Check for non-200 HTTP status from OpenAI
+        if (!response.ok) {
+            console.error(`OpenAI HTTP Error ${response.status} during title generation.`);
+            // Fallback to a default title instead of failing the whole request
+            return res.json({ title: "New Chat" }); 
+        }
+
         const data = await response.json();
         const title = data.choices?.[0]?.message?.content?.trim() || "New Chat";
 
@@ -334,8 +364,6 @@ app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   console.log(`Frontend URL for OAuth: http://localhost:3000`);
 });
-
-
 
 
 
