@@ -25,7 +25,7 @@ const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 // ===============================
 // The REDIRECT_BASE_URL MUST be set as an environment variable in Render 
 // and MUST match the base URL registered in your Google Cloud Console.
-const REDIRECT_BASE_URL = process.env.REDIRECT_BASE_URL || "http://localhost:3000"; // Use localhost for local dev
+const REDIRECT_BASE_URL = process.env.REDIRECT_BASE_URL || "https://art-chatbot.onrender.com";
 const REDIRECT_URI = `${REDIRECT_BASE_URL}/auth/google/callback`;
 
 console.log("Using REDIRECT_URI:", REDIRECT_URI);
@@ -37,12 +37,31 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // ⚠️ Temporary in-memory token storage (use DB for multiple users)
-let userTokens = {};
-let userEmail = null;
+let userTokens = {}; // key: email, value: tokens
 
 // ===============================
 // 3️⃣ GMAIL AUTH ROUTES
 // ===============================
+
+// Utility function to get the current user's email
+async function getUserEmail(tokens) {
+  if (!tokens || !tokens.access_token) return null;
+  
+  const userInfoClient = new google.auth.OAuth2();
+  userInfoClient.setCredentials(tokens);
+  
+  const people = google.people({ version: 'v1', auth: userInfoClient });
+  try {
+    const res = await people.people.get({
+      resourceName: 'people/me',
+      personFields: 'emailAddresses',
+    });
+    return res.data.emailAddresses[0].value;
+  } catch (error) {
+    console.error("Error fetching user email:", error);
+    return null;
+  }
+}
 
 // Step 1: Redirect to Google for consent
 app.get("/auth/google", (req, res) => {
@@ -52,61 +71,141 @@ app.get("/auth/google", (req, res) => {
       "https://www.googleapis.com/auth/userinfo.email",
       "https://www.googleapis.com/auth/gmail.send",
     ],
+    prompt: "consent", // Force refresh token
   });
   res.redirect(authUrl);
 });
 
-// Step 2: Handle callback from Google
+// Step 2: Handle callback and exchange code for tokens
 app.get("/auth/google/callback", async (req, res) => {
   const { code } = req.query;
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-    userTokens = tokens; 
+    
+    // Get the user's email to use as the storage key
+    const email = await getUserEmail(tokens);
 
-    // Get user email
-    const oauth2 = google.oauth2({ auth: oauth2Client, version: 'v2' });
-    const userInfo = await oauth2.userinfo.get();
-    userEmail = userInfo.data.email;
-
-    // Send success message to the parent window (widget)
-    res.send(`
-        <script>
-            window.opener.postMessage({ 
-                type: 'AUTH_SUCCESS', 
-                isConnected: true, 
-                email: '${userEmail}' 
-            }, '${REDIRECT_BASE_URL}');
-            window.close();
-        </script>
-    `);
+    if (email) {
+        userTokens[email] = tokens;
+        console.log(`Tokens stored for ${email}.`);
+        
+        // Respond to the client window with success message
+        res.send(`
+            <script>
+                // Send a message back to the originating window (the widget)
+                window.opener.postMessage({ 
+                    type: 'AUTH_SUCCESS', 
+                    isConnected: true, 
+                    email: '${email}' 
+                }, '*'); // Replace '*' with the widget's actual origin in production
+                window.close();
+            </script>
+        `);
+    } else {
+        throw new Error("Could not retrieve user email.");
+    }
   } catch (error) {
-    console.error("Authentication error:", error);
+    console.error("Error during authentication callback:", error);
     res.status(500).send("Authentication failed. Please check server logs.");
   }
 });
 
-// Endpoint to check connection status
-app.get("/auth/status", (req, res) => {
-    const isConnected = !!userTokens.access_token;
-    res.json({ isConnected: isConnected, email: userEmail });
+// Endpoint to check connection status (for widget load)
+app.get("/auth/status", async (req, res) => {
+    // In a single-user demo, we just check if we have any tokens stored.
+    // In a multi-user app, you would check tokens based on a session ID.
+    const emails = Object.keys(userTokens);
+    if (emails.length > 0) {
+        const email = emails[0];
+        // Optional: check if the token is still valid (not implemented here)
+        return res.json({ isConnected: true, email: email });
+    }
+    res.json({ isConnected: false, email: "" });
 });
 
 
 // ===============================
-// 4️⃣ TOOL DEFINITION (send_email)
+// 4️⃣ GMAIL API (TOOL EXECUTION)
+// ===============================
+
+// Utility function to send the email
+async function sendGmail(recipient_email, subject, body, senderEmail) {
+    const tokens = userTokens[senderEmail];
+    if (!tokens) {
+        throw new Error("User tokens not found. Please connect Gmail.");
+    }
+
+    // Set credentials for the current user
+    oauth2Client.setCredentials(tokens);
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    // Construct the email message
+    const raw = [
+        `To: ${recipient_email}`,
+        `Subject: ${subject}`,
+        'Content-Type: text/plain; charset="UTF-8"',
+        'MIME-Version: 1.0',
+        '',
+        body,
+    ].join('\n');
+
+    const encodedMessage = Buffer.from(raw).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    // Send the email
+    const result = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+            raw: encodedMessage,
+        },
+    });
+
+    return result.data;
+}
+
+// Endpoint called by the widget to execute the email send
+app.post("/email/send", async (req, res) => {
+  try {
+    const { recipient_email, subject, body } = req.body;
+    
+    // In a real app, the sender email would come from session data
+    const senderEmail = Object.keys(userTokens)[0]; 
+
+    if (!senderEmail) {
+        return res.status(401).json({ success: false, message: "❌ Gmail not connected. Cannot send email." });
+    }
+    
+    // Execute the send
+    const result = await sendGmail(recipient_email, subject, body, senderEmail);
+    
+    console.log("Email sent successfully:", result);
+    res.json({ success: true, message: "✅ Email sent successfully." });
+  } catch (error) {
+    console.error("Email send error:", error);
+    // Try to provide a more specific error if possible
+    let errorMessage = "❌ Failed to send email.";
+    if (error.code === 401) {
+        errorMessage += " (Authentication required or token expired.)";
+    }
+    res.status(500).json({ success: false, message: errorMessage });
+  }
+});
+
+
+// ===============================
+// 5️⃣ AI TOOL DEFINITION
 // ===============================
 const emailToolDefinition = {
   type: "function",
   function: {
     name: "send_email",
-    description: "Sends an email on behalf of the user. Only use this when the user explicitly asks to send an email and provides the recipient, subject, and body.",
+    description: "Sends an email to a specified recipient with a subject and plain text body. Use this when the user explicitly asks to draft or send an email.",
     parameters: {
       type: "object",
       properties: {
         recipient_email: {
           type: "string",
-          description: "The full email address of the recipient, e.g., 'jane.doe@example.com'.",
+          description: "The complete email address of the recipient (e.g., jane.doe@example.com).",
         },
         subject: {
           type: "string",
@@ -114,7 +213,7 @@ const emailToolDefinition = {
         },
         body: {
           type: "string",
-          description: "The full body content of the email, formatted as plain text.",
+          description: "The plain text body content of the email. Do not include HTML.",
         },
       },
       required: ["recipient_email", "subject", "body"],
@@ -123,99 +222,39 @@ const emailToolDefinition = {
 };
 
 // ===============================
-// 5️⃣ GMAIL EMAIL SEND ENDPOINT
-// ===============================
-
-// Helper function to create the raw email content
-function createEmail(to, subject, body) {
-  const email = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    `MIME-Version: 1.0`,
-    `Content-Type: text/plain; charset="UTF-8"`,
-    `Content-Transfer-Encoding: base64`,
-    ``,
-    body,
-  ].join('\n');
-
-  // Base64 encode the email content
-  const base64EncodedEmail = Buffer.from(email).toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  
-  return base64EncodedEmail;
-}
-
-app.post("/email/send", async (req, res) => {
-  try {
-    const { recipient_email, subject, body } = req.body;
-
-    if (!userTokens.access_token) {
-      return res.status(401).json({ success: false, message: "Gmail not connected. Cannot send email." });
-    }
-
-    // Set credentials for the current request
-    oauth2Client.setCredentials(userTokens);
-    const gmail = google.gmail({ version: "v1", auth: oauth2Client });
-    
-    const rawEmail = createEmail(recipient_email, subject, body);
-
-    await gmail.users.messages.send({
-      userId: "me",
-      requestBody: {
-        raw: rawEmail,
-      },
-    });
-
-    res.json({ success: true, message: "✅ Email sent successfully." });
-  } catch (error) {
-    console.error("Email send error:", error);
-    res.status(500).json({ success: false, message: "❌ Failed to send email. Check recipient address and server logs." });
-  }
-});
-
-
-// ===============================
 // 6️⃣ ASSISTLY CHATBOT ENDPOINT
 // ===============================
 app.post("/chat", async (req, res) => {
   try {
-    // 1. Extract data sent from the client
-    const { isGmailConnected, currentChat } = req.body;
-    
-    // 2. Define the System Instruction (updated with connection status)
-    const systemInstructionContent = `You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. Your primary goal is to answer user questions, summarize information, and act as a conversational partner.
-    You have access to the 'send_email' tool, which you MUST only use if the user explicitly asks you to draft or send an email and provides the necessary details (recipient, subject, body).
-    Current Gmail connection status: ${isGmailConnected ? 'CONNECTED' : 'NOT CONNECTED'}. If the user asks to send an email but the status is NOT CONNECTED, inform them that the tool is unavailable until they connect their Gmail.
-    Format your answers cleanly with bold key points and bullet lists where relevant.`;
+    // ⚠️ FIX: Destructure the correct properties from the body
+    const { currentChat, isGmailConnected } = req.body; 
 
-    // 3. Construct the Message History
-    // Map the client's simple message format to the OpenAI API format (role: user/assistant, content: text)
-    // The client's currentChat array contains all messages including the latest user message.
-    const messages = [
-        {
-          role: "system",
-          content: systemInstructionContent,
-        },
-        ...currentChat
-            .filter(msg => msg.text) // Filter out any empty messages
-            .map(msg => ({
-                role: msg.sender === 'user' ? 'user' : 'assistant',
-                content: msg.text,
-            })),
-    ];
+    if (!currentChat || currentChat.length === 0) {
+        return res.status(400).json({ error: "Missing chat history." });
+    }
+
+    // ⚠️ FIX: Construct the message history array in OpenAI format
+    const formattedHistory = currentChat.map(msg => ({
+        // Map 'user' to 'user' role, and 'bot' to 'assistant' role
+        role: msg.sender === 'user' ? 'user' : 'assistant',
+        content: msg.text,
+    }));
     
-    // 4. Construct the OpenAI API Payload
+    // System instruction is always first
+    const systemInstruction = {
+        role: "system",
+        content: `You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. Format your answers cleanly with bold key points and bullet lists where relevant.
+        ${isGmailConnected ? 'The user is currently connected to their Gmail account. Use the `send_email` tool when they ask to draft or send a new email.' : 'The user is NOT connected to their Gmail account. Do not offer or use the `send_email` tool.'}`,
+    };
+    
+    // Construct the final payload for OpenAI
     const payload = {
       model: "gpt-4o-mini",
-      messages: messages, // Now includes history!
-      // Only provide the tool definition if the user is connected
-      tools: isGmailConnected ? [emailToolDefinition] : undefined, 
+      messages: [systemInstruction, ...formattedHistory], // Use the full history
+      tools: isGmailConnected ? [emailToolDefinition] : undefined, // Only provide the tool if connected
       tool_choice: "auto", 
     };
 
-    // 5. Call OpenAI API
     const response = await fetch(OPENAI_URL, {
       method: "POST",
       headers: {
@@ -228,8 +267,12 @@ app.post("/chat", async (req, res) => {
     const data = await response.json();
     const candidate = data.choices?.[0]?.message;
 
-    // 6. Handle Tool Call or Text Reply
-    
+    // Check for OpenAI API errors (e.g., invalid key, rate limit)
+    if (data.error) {
+        console.error("OpenAI API Error:", data.error);
+        return res.status(502).json({ error: data.error.message || "OpenAI API returned an error." });
+    }
+
     // Check if the AI decided to call a function/tool
     if (candidate && candidate.tool_calls && candidate.tool_calls.length > 0) {
       const toolCall = candidate.tool_calls[0];
@@ -241,59 +284,55 @@ app.post("/chat", async (req, res) => {
     }
 
     // If no function call, return the standard text reply
-    const aiResponse = candidate?.content || "No response.";
+    const aiResponse = candidate?.content || "No response. (AI content missing)";
     res.json({ reply: aiResponse });
 
   } catch (error) {
+    console.log("Request Body:", req.body); // Log request body for debugging
     console.error("Chatbot error:", error);
     res.status(500).json({ error: "Failed to connect to AI service." });
   }
 });
 
+
 // ===============================
-// 7️⃣ CHAT TITLE ENDPOINT
+// 7️⃣ TITLE GENERATION ENDPOINT
 // ===============================
 app.post("/title", async (req, res) => {
-  try {
-    const { message } = req.body;
-    
-    const payload = {
-        model: "gpt-3.5-turbo",
-        messages: [
-            {
-                role: "system",
-                content: "You are a professional chat summary generator. Your sole job is to create a concise, 4-5 word summary title for the user's initial message. Only output the title string.",
+    try {
+        const { message } = req.body;
+        const prompt = `Based on this first message from a user, generate a very brief, title-case summary (max 5 words, no punctuation) that can be used as a chat title. Example: 'Help with my project' -> 'Project Assistance'. Message: "${message}"`;
+        
+        const response = await fetch(OPENAI_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
             },
-            { role: "user", content: `Generate a short title for this message: "${message}"` },
-        ],
-        temperature: 0.1,
-    };
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: prompt }],
+            }),
+        });
 
-    const response = await fetch(OPENAI_URL, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify(payload),
-    });
+        const data = await response.json();
+        const title = data.choices?.[0]?.message?.content?.trim() || "New Chat";
 
-    const data = await response.json();
-    const title = data.choices?.[0]?.message?.content || "New Chat";
-
-    res.json({ title: title.trim().replace(/['"“”]/g, '') }); // Remove surrounding quotes
-  } catch (error) {
-    console.error("Title generation error:", error);
-    res.status(500).json({ error: "Failed to generate title." });
-  }
+        res.json({ title: title.replace(/['".]/g, '') }); // Clean up punctuation
+    } catch (error) {
+        console.error("Title generation error:", error);
+        res.status(500).json({ error: "Failed to generate title." });
+    }
 });
 
+
 // ===============================
-// 8️⃣ SERVER STARTUP
+// 8️⃣ START SERVER
 // ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Frontend URL for OAuth: http://localhost:3000`);
 });
 
 
