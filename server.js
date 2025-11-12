@@ -1,5 +1,5 @@
 // ===============================
-// Assistly Server (TOKEN REFRESH FIX)
+// Assistly Server (Syncing Endpoints)
 // ===============================
 import express from "express";
 import cors from "cors";
@@ -84,20 +84,21 @@ app.get("/auth/google/callback", async (req, res) => {
     res.send('<script>window.close();</script>');
   } catch (error) {
     console.error("Authentication error:", error);
-    res.status(500).send("Authentication failed. Check your logs and environment variables.");
+    // The error is often related to the redirect URI mismatch, which causes the token exchange to fail.
+    res.status(500).send("Authentication failed. Check your logs and Google Cloud Console Redirect URIs.");
   }
 });
 
 // ===============================
 // 4️⃣ GMAIL STATUS CHECK ENDPOINT
 // ===============================
-// The frontend calls this to update the UI status.
-app.get("/gmail-status", (req, res) => {
+// The frontend calls this to update the UI status. (Changed from /gmail-status to /auth/status to match client)
+app.get("/auth/status", (req, res) => {
     // Check for refresh_token as well, as that's what keeps the session alive long-term
     if (userTokens.access_token && userTokens.email && userTokens.refresh_token) {
-        res.json({ connected: true, email: userTokens.email });
+        res.json({ isConnected: true, email: userTokens.email });
     } else {
-        res.json({ connected: false, email: null });
+        res.json({ isConnected: false, email: null });
     }
 });
 
@@ -105,9 +106,9 @@ app.get("/gmail-status", (req, res) => {
 // ===============================
 // 5️⃣ GMAIL EMAIL SEND ENDPOINT (Tool Execution)
 // ===============================
-// The frontend calls this when the AI requests the 'send_email' tool.
-app.post("/send-email", async (req, res) => {
-  const { to, subject, body } = req.body;
+// The frontend calls this when the AI requests the 'send_email' tool. (Changed from /send-email to /email/send to match client)
+app.post("/email/send", async (req, res) => {
+  const { recipient_email: to, subject, body } = req.body;
 
   if (!userTokens.access_token) {
     return res.status(401).json({ 
@@ -188,7 +189,7 @@ const emailToolDefinition = {
         parameters: {
             type: "object",
             properties: {
-                to: {
+                recipient_email: { // Changed key name to match client's expectation
                     type: "string",
                     description: "The recipient's full email address (e.g., john.doe@example.com).",
                 },
@@ -201,30 +202,44 @@ const emailToolDefinition = {
                     description: "The main content or body of the email. Write out the full text of the email here.",
                 },
             },
-            required: ["to", "subject", "body"],
+            required: ["recipient_email", "subject", "body"],
         },
     },
 };
 
 app.post("/chat", async (req, res) => {
   try {
-    const { message, isGmailConnected } = req.body;
+    const { message, isGmailConnected, currentChat } = req.body;
     
-    const systemPrompt = 
+    // Construct chat history for context
+    let messages = [{ role: "system", content: 
         "You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. " +
         "Format your answers cleanly with bold key points and bullet lists where relevant. " +
         "You have the ability to send emails via the `send_email` tool. " +
         (isGmailConnected 
             ? "The Gmail service is currently **connected**. Use the `send_email` tool when the user's intent is clearly to send an email."
-            : "The Gmail service is currently **not connected**. If the user asks to send an email, politely inform them that they must connect their Gmail account first.");
+            : "The Gmail service is currently **not connected**. If the user asks to send an email, politely inform them that they must connect their Gmail account first.")
+    }];
+
+    // Add previous messages (currentChat from frontend is the history)
+    if (Array.isArray(currentChat)) {
+        currentChat.forEach(msg => {
+            if (msg.sender === 'user') {
+                messages.push({ role: 'user', content: msg.text });
+            } else if (msg.sender === 'bot' && !msg.text.includes('Email Confirmation')) {
+                // Do not include tool call confirmations in history sent to AI
+                messages.push({ role: 'assistant', content: msg.text });
+            }
+        });
+    }
+    
+    // Add the latest user message
+    messages.push({ role: "user", content: message });
 
 
     const payload = {
       model: "gpt-4o-mini", 
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: message },
-      ],
+      messages: messages,
       // Only provide the tool if the frontend has confirmed the user is authenticated
       tools: isGmailConnected ? [emailToolDefinition] : undefined, 
       tool_choice: "auto", 
