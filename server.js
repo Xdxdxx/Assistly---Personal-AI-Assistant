@@ -1,5 +1,5 @@
 // ===============================
-// Assistly Server (Syncing Endpoints)
+// Assistly Server (UPDATED)
 // ===============================
 import express from "express";
 import cors from "cors";
@@ -23,12 +23,10 @@ const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 // ===============================
 // 2️⃣ GOOGLE OAUTH CONFIG
 // ===============================
-// The REDIRECT_BASE_URL MUST be set as an environment variable in Render 
-// and MUST match the base URL registered in your Google Cloud Console.
-const REDIRECT_BASE_URL = process.env.REDIRECT_BASE_URL || "https://art-chatbot.onrender.com";
-const REDIRECT_URI = `${REDIRECT_BASE_URL}/auth/google/callback`;
-
-console.log("Using REDIRECT_URI:", REDIRECT_URI);
+// The redirect URI MUST match the one set in your Google Cloud Console.
+// Change "http://localhost:3000/auth/google/callback" to your actual
+// Render/Netlify backend URL (e.g., https://your-backend.onrender.com/auth/google/callback)
+const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3000/auth/google/callback";
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -36,8 +34,9 @@ const oauth2Client = new google.auth.OAuth2(
   REDIRECT_URI
 );
 
-// ⚠️ Temporary in-memory token storage (use a DB for multiple users)
-let userTokens = {};
+// ⚠️ Temporary in-memory token storage (use DB for multiple users)
+// Key: Session ID, Value: { tokens: { access_token, refresh_token, expiry_date }, email: string }
+let userTokens = {}; 
 
 // ===============================
 // 3️⃣ GMAIL AUTH ROUTES
@@ -47,94 +46,124 @@ let userTokens = {};
 app.get("/auth/google", (req, res) => {
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: "offline",
-    // ⚠️ IMPORTANT: prompt: 'consent' forces Google to issue a new refresh token every time.
-    prompt: "consent", 
     scope: [
-      "https://www.googleapis.com/auth/gmail.send", 
-      "https://www.googleapis.com/auth/userinfo.email", 
+      "https://www.googleapis.com/auth/gmail.send", // Scope needed to send emails
+      "https://www.googleapis.com/auth/userinfo.email" // To get the user's email
     ],
-    state: Date.now().toString(), 
+    // State is used to track the user session (in a real app)
+    state: 'default-session-id', 
   });
   res.redirect(authUrl);
 });
 
 // Step 2: Handle the callback from Google
 app.get("/auth/google/callback", async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
 
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    
-    // Store ALL tokens (including refresh_token)
-    userTokens = tokens; 
-    
     oauth2Client.setCredentials(tokens);
-    
-    // Use the token to fetch the connected user's email address
-    const response = await fetch('https://www.googleapis.com/oauth2/v1/userinfo?alt=json', {
-        headers: { 'Authorization': `Bearer ${tokens.access_token}` }
-    });
-    const profile = await response.json();
-    userTokens.email = profile.email;
-    
-    // Log for debugging: confirm refresh token exists
-    console.log("Authentication successful. Refresh Token received:", !!userTokens.refresh_token);
 
-    // Close the pop-up window in the frontend
-    res.send('<script>window.close();</script>');
+    // Get the user's email
+    const people = google.people({ version: 'v1', auth: oauth2Client });
+    const profile = await people.people.get({
+        resourceName: 'people/me',
+        personFields: 'emailAddresses',
+    });
+    const email = profile.data.emailAddresses[0].value;
+    
+    // Store tokens and email
+    userTokens[state || 'default-session-id'] = { tokens, email };
+    
+    // Send a message back to the frontend (which is running the widget)
+    // In a real app, this would redirect back to the widget URL.
+    res.send(`
+      <script>
+        // This script runs in the callback window and tells the main widget window the status.
+        if (window.opener) {
+            window.opener.postMessage({ 
+                type: 'AUTH_SUCCESS', 
+                isConnected: true,
+                email: '${email}' 
+            }, '*'); // Replace '*' with your actual widget origin in production
+            window.close();
+        } else {
+            document.body.innerHTML = 'Authentication successful! You can close this window now.';
+        }
+      </script>
+    `);
   } catch (error) {
-    console.error("Authentication error:", error);
-    // The error is often related to the redirect URI mismatch, which causes the token exchange to fail.
-    res.status(500).send("Authentication failed. Check your logs and Google Cloud Console Redirect URIs.");
+    console.error("Auth callback error:", error);
+    res.status(500).send("Authentication failed.");
   }
 });
 
-// ===============================
-// 4️⃣ GMAIL STATUS CHECK ENDPOINT
-// ===============================
-// The frontend calls this to update the UI status. (Changed from /gmail-status to /auth/status to match client)
+// Route to check if the user is connected
 app.get("/auth/status", (req, res) => {
-    // Check for refresh_token as well, as that's what keeps the session alive long-term
-    if (userTokens.access_token && userTokens.email && userTokens.refresh_token) {
-        res.json({ isConnected: true, email: userTokens.email });
-    } else {
-        res.json({ isConnected: false, email: null });
-    }
+    // Check if the default session has tokens
+    const sessionData = userTokens['default-session-id'];
+    res.json({ 
+        isConnected: !!sessionData,
+        email: sessionData ? sessionData.email : null
+    });
 });
 
+// ===============================
+// 4️⃣ GMAIL TOOL DEFINITION
+// ===============================
+
+// Tool definition for the AI
+const emailToolDefinition = {
+    type: "function",
+    function: {
+        name: "send_email",
+        description: "Sends an email to a specified recipient with a subject and body. Only call this tool if the user explicitly asks to send an email.",
+        parameters: {
+            type: "object",
+            properties: {
+                recipient_email: {
+                    type: "string",
+                    description: "The full email address of the recipient (e.g., john@example.com)."
+                },
+                subject: {
+                    type: "string",
+                    description: "The subject line of the email."
+                },
+                body: {
+                    type: "string",
+                    description: "The full content of the email body."
+                }
+            },
+            required: ["recipient_email", "subject", "body"]
+        }
+    }
+};
 
 // ===============================
-// 5️⃣ GMAIL EMAIL SEND ENDPOINT (Tool Execution)
+// 5️⃣ EMAIL SENDING ENDPOINT
 // ===============================
-// The frontend calls this when the AI requests the 'send_email' tool. (Changed from /send-email to /email/send to match client)
+
 app.post("/email/send", async (req, res) => {
-  const { recipient_email: to, subject, body } = req.body;
+  // Use the tokens from the default session
+  const sessionData = userTokens['default-session-id'];
 
-  if (!userTokens.access_token) {
-    return res.status(401).json({ 
-        success: false, 
-        message: "🚫 Error: Gmail not connected. Please connect your Gmail account first." 
-    });
+  if (!sessionData) {
+    return res.status(401).json({ success: false, message: "User is not authenticated with Gmail." });
   }
 
-  // Set credentials from stored tokens
-  oauth2Client.setCredentials(userTokens);
-  
-  try {
-    // 1. Explicitly refresh the token before use. 
-    // This handles expiry and updates userTokens if successful.
-    const { credentials } = await oauth2Client.refreshAccessToken(); 
-    // Update the in-memory token store with the new access token
-    userTokens.access_token = credentials.access_token; 
-    userTokens.expiry_date = credentials.expiry_date; 
-    
-    console.log("Token successfully refreshed. Proceeding with email send.");
+  const { recipient_email, subject, body } = req.body;
+  const { tokens, email: senderEmail } = sessionData;
 
+  // Set credentials for the current request
+  oauth2Client.setCredentials(tokens);
+
+  try {
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
-    
-    // 2. Format the email as a raw, base64url-encoded string
-    const emailContent = [
-      `To: ${to}`,
+
+    // Create the raw email content
+    const raw = [
+      `To: ${recipient_email}`,
+      `From: ${senderEmail}`,
       `Subject: ${subject}`,
       "MIME-Version: 1.0",
       "Content-Type: text/plain; charset=utf-8",
@@ -142,107 +171,55 @@ app.post("/email/send", async (req, res) => {
       body,
     ].join("\n");
 
-    const base64Email = Buffer.from(emailContent)
+    // Base64 encode the email, replacing specific characters
+    const encodedMail = Buffer.from(raw)
       .toString("base64")
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
       .replace(/=+$/, "");
 
-    // 3. Send the email
     await gmail.users.messages.send({
       userId: "me",
       requestBody: {
-        raw: base64Email,
+        raw: encodedMail,
       },
     });
 
-    res.json({ 
-        success: true, 
-        message: `✅ Email successfully sent to **${to}** with subject: "${subject}"` 
-    });
+    res.json({ success: true, message: "Email sent successfully." });
   } catch (error) {
     console.error("Email send error:", error);
-    
-    // ⚠️ CRITICAL: Check for common token failure messages (e.g., Google or JWT errors)
-    if (error.code === 401 || error.message.includes('invalid_grant') || error.message.includes('invalid_token')) {
-         userTokens = {}; // Clear tokens to force a full re-auth
-         console.log("Access token is invalid. Cleared userTokens.");
-         return res.status(401).json({ 
-            success: false, 
-            message: "❌ Failed to send email. The Gmail connection is no longer valid. Please click 'Connect Gmail' to re-authenticate." 
-        });
-    }
-
-    res.status(500).json({ success: false, message: "❌ Failed to send email. A server error occurred." });
+    res.status(500).json({ success: false, message: "❌ Failed to send email." });
   }
 });
 
 // ===============================
 // 6️⃣ ASSISTLY CHATBOT ENDPOINT
 // ===============================
-// The function definition for the AI to use
-const emailToolDefinition = {
-    type: "function",
-    function: {
-        name: "send_email",
-        description: "Sends an email to a specified recipient with a subject and body. Only use this function when the user explicitly asks to send an email.",
-        parameters: {
-            type: "object",
-            properties: {
-                recipient_email: { // Changed key name to match client's expectation
-                    type: "string",
-                    description: "The recipient's full email address (e.g., john.doe@example.com).",
-                },
-                subject: {
-                    type: "string",
-                    description: "The subject line of the email.",
-                },
-                body: {
-                    type: "string",
-                    description: "The main content or body of the email. Write out the full text of the email here.",
-                },
-            },
-            required: ["recipient_email", "subject", "body"],
-        },
-    },
-};
-
 app.post("/chat", async (req, res) => {
   try {
     const { message, isGmailConnected, currentChat } = req.body;
     
-    // Construct chat history for context
-    let messages = [{ role: "system", content: 
-        "You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. " +
-        "Format your answers cleanly with bold key points and bullet lists where relevant. " +
-        "You have the ability to send emails via the `send_email` tool. " +
-        (isGmailConnected 
-            ? "The Gmail service is currently **connected**. Use the `send_email` tool when the user's intent is clearly to send an email."
-            : "The Gmail service is currently **not connected**. If the user asks to send an email, politely inform them that they must connect their Gmail account first.")
-    }];
-
-    // Add previous messages (currentChat from frontend is the history)
-    if (Array.isArray(currentChat)) {
-        currentChat.forEach(msg => {
-            if (msg.sender === 'user') {
-                messages.push({ role: 'user', content: msg.text });
-            } else if (msg.sender === 'bot' && !msg.text.includes('Email Confirmation')) {
-                // Do not include tool call confirmations in history sent to AI
-                messages.push({ role: 'assistant', content: msg.text });
-            }
-        });
-    }
+    // Construct the chat history for context
+    const chatHistory = currentChat.map(msg => ({
+      role: msg.sender === 'user' ? 'user' : 'assistant',
+      content: msg.text
+    }));
     
-    // Add the latest user message
-    messages.push({ role: "user", content: message });
-
+    // Add the current user message to the history
+    chatHistory.push({ role: 'user', content: message });
+    
+    // System instruction updated to discourage headings (#)
+    const systemInstruction = 
+      "You are Assistly, a helpful and knowledgeable personal AI assistant chatbot. Respond using clean, simple Markdown. DO NOT use markdown headings (H1, H2, H3, etc., starting with #). Use **bold text** and bullet lists where relevant for formatting.";
 
     const payload = {
-      model: "gpt-4o-mini", 
-      messages: messages,
-      // Only provide the tool if the frontend has confirmed the user is authenticated
-      tools: isGmailConnected ? [emailToolDefinition] : undefined, 
-      tool_choice: "auto", 
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemInstruction },
+        ...chatHistory, // Use full history
+      ],
+      tools: isGmailConnected ? [emailToolDefinition] : undefined, // Only provide the tool if connected
+      tool_choice: "auto",
     };
 
     const response = await fetch(OPENAI_URL, {
@@ -262,7 +239,7 @@ app.post("/chat", async (req, res) => {
       const toolCall = candidate.tool_calls[0];
       if (toolCall.function.name === "send_email") {
         const args = JSON.parse(toolCall.function.arguments);
-        // Return the function call arguments directly to the frontend for execution
+        // Return the function call arguments directly to the frontend
         return res.json({ tool_call: { name: "send_email", args: args } });
       }
     }
@@ -277,13 +254,51 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+// ===============================
+// 7️⃣ TITLE GENERATION ENDPOINT
+// ===============================
+app.post("/title", async (req, res) => {
+    try {
+        const { message } = req.body;
+        
+        const titlePayload = {
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "system",
+                    content: "You are a concise title generator. Based on the user's first message, provide a very short, 2-5 word title for the chat. Respond with ONLY the title text and nothing else. Do not use quotation marks."
+                },
+                { role: "user", content: message }
+            ],
+            max_tokens: 15, // Keep it short
+        };
+
+        const response = await fetch(OPENAI_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify(titlePayload),
+        });
+
+        const data = await response.json();
+        const aiResponse = data.choices?.[0]?.message?.content?.trim() || "New Chat";
+
+        res.json({ title: aiResponse });
+    } catch (error) {
+        console.error("Title generation error:", error);
+        res.status(500).json({ error: "Failed to generate title." });
+    }
+});
+
 
 // ===============================
-// 7️⃣ START SERVER
+// 8️⃣ SERVER START
 // ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
 
 
